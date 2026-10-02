@@ -1,0 +1,13 @@
+# build artifacts
+build/
+cmake-build-*/
+examples/*.cpp
+# generated runtime header
+py_runtime.h
+examples/py_runtime.h
+# IDE
+.idea/
+.DS_Store
+
+# local workspace memory
+.workbuddy/
