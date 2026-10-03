@@ -2,6 +2,8 @@
 build/
 cmake-build-*/
 examples/*.cpp
+# generated transpiler output at the repo root (e.g. `p2cpp foo.py -o test.cpp`)
+/test.cpp
 # generated runtime header
 py_runtime.h
 examples/py_runtime.h

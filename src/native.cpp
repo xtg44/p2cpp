@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <functional>
 #include <map>
 #include <set>
 #include <sstream>
@@ -110,6 +111,23 @@ bool isZeroConst(const Expr* e) {
     return false;
 }
 
+// A value whose assignment after a default-initialised declaration is a no-op:
+// `0`, `0.0`, `""`, an empty list/set/dict, or `None`. `x = 0` right after
+// `long long x{};` does nothing, so the emitter drops it.
+bool isDefaultValue(const Expr* e) {
+    if (!e) return false;
+    switch (e->kind) {
+        case EK::IntLit: return e->i == 0;
+        case EK::FloatLit: return e->numLit == 0.0;
+        case EK::StrLit: return e->s.empty();
+        case EK::NoneLit: return true;
+        case EK::ListLit:
+        case EK::SetLit:
+        case EK::DictLit: return e->items.empty();
+        default: return false;
+    }
+}
+
 // Element type as Python sees it: iterating a str yields 1-character strings.
 std::string elemOf(const std::string& t) {
     if (isVecT(t) || isSetT(t)) return tplInner(t);
@@ -125,57 +143,6 @@ std::string valOf(const std::string& t) {
     if (!isMapT(t)) return "";
     auto p = splitTop(tplInner(t));
     return p.size() == 2 ? p[1] : "";
-}
-
-// ===========================================================================
-// name collection (used to decide whether a loop target outlives its loop)
-// ===========================================================================
-
-void collectNames(const Expr* e, std::vector<std::string>& out);
-
-void collectNamesList(const std::vector<ExprP>& v, std::vector<std::string>& out) {
-    for (const auto& e : v) collectNames(e.get(), out);
-}
-
-void collectNames(const Expr* e, std::vector<std::string>& out) {
-    if (!e) return;
-    if (e->kind == EK::Name) out.push_back(e->s);
-    collectNames(e->a.get(), out);
-    collectNames(e->b.get(), out);
-    collectNames(e->c.get(), out);
-    collectNames(e->d.get(), out);
-    collectNamesList(e->items, out);
-    collectNamesList(e->compTargets, out);
-    collectNamesList(e->compIters, out);
-    for (const auto& cl : e->compIfsNested) collectNamesList(cl, out);
-    for (const auto& p : e->kwargs) collectNames(p.second.get(), out);
-    for (const auto& p : e->parts)
-        if (p.isExpr) collectNames(p.expr.get(), out);
-}
-
-void collectNamesExcept(const Stmt* s, const Stmt* skip, std::vector<std::string>& out);
-
-void collectNamesBody(const std::vector<StmtP>& body, const Stmt* skip,
-                      std::vector<std::string>& out) {
-    for (const auto& s : body) collectNamesExcept(s.get(), skip, out);
-}
-
-void collectNamesExcept(const Stmt* s, const Stmt* skip, std::vector<std::string>& out) {
-    if (!s || s == skip) return;
-    collectNames(s->a.get(), out);
-    collectNames(s->b.get(), out);
-    collectNames(s->c.get(), out);
-    collectNames(s->iter.get(), out);
-    collectNamesList(s->targets, out);
-    collectNamesList(s->values, out);
-    collectNamesBody(s->body, skip, out);
-    collectNamesBody(s->orelse, skip, out);
-    collectNamesBody(s->finalbody, skip, out);
-    for (const auto& h : s->handlers) collectNamesBody(h.body, skip, out);
-}
-
-bool listed(const std::vector<std::string>& v, const std::string& s) {
-    return std::find(v.begin(), v.end(), s) != v.end();
 }
 
 // ===========================================================================
@@ -209,8 +176,19 @@ private:
     std::map<std::string, std::string> funcRet;  // memo, "" = not yet known
     std::map<std::string, const Stmt*> klasses;
     std::vector<std::string> classOrder;
+    // class name -> member name -> member type, resolved once in emitClass so
+    // typeOf() can look up `a.x` from any scope (emitFuncs, methods, main).
+    std::map<std::string, std::map<std::string, std::string>> classMembers;
     std::set<std::string> modules;
     std::map<std::string, std::vector<std::string>> ctorArgs;
+    // Argument types of every call to a user function, collected from the call
+    // sites before signatures are emitted. When a parameter is passed the same
+    // type at every call site, the signature is specialised to it (instead of
+    // leaving it a template), so `bubble_sort(data)` becomes
+    // `bubble_sort(std::vector<long long> arr)` rather than a function template.
+    // Indexed by position among the ordinary parameters (self/*args/**kwargs
+    // are skipped, matching how signature() walks them).
+    std::map<std::string, std::vector<std::string>> funcArgTypes;
 
     std::vector<std::map<std::string, std::string>> scopes;
     bool inFunction = false;
@@ -222,6 +200,15 @@ private:
     // Names that have to be defined where they are assigned (`auto lg = make()`),
     // because their type is a closure: not default-constructible, not assignable.
     std::set<std::string> inPlaceNames, inPlaceDone;
+    // For-loop targets that are read after their loop (so they need an explicit
+    // declaration). A target absent from this set and read only inside its loop
+    // is declared straight in the range-for header instead.
+    std::set<std::string> leakedForTargets;
+    // Variables that have just been default-initialised by a declaration and
+    // have not yet been given a real value. A following `x = 0` / `x = []`
+    // assignment is then a no-op (the declaration already zeroes it) and is
+    // dropped for readability. Assigning anything else removes the name.
+    std::set<std::string> defaultInitNames;
 
     // Values are printed inline (floats via operator<<, containers via an
     // inline lambda), so the only helpers still emitted are the format-spec
@@ -272,6 +259,13 @@ private:
     std::string callType(const Expr* e);
     // Return type of a user function, read off its `return` statements.
     std::string funcReturnType(const std::string& name);
+    // Return type of a class method, read off its `return` statements (member
+    // types bound so `return self.x` resolves).
+    std::string methodReturnType(const std::string& klass, const std::string& method);
+    // The C++ type of a class member, read off its `self.x = ...` in `__init__`.
+    std::string memberType(const std::string& klass, const std::string& member);
+    // The type of a class attribute (a module-level assignment in the class body).
+    std::string staticMemberType(const std::string& klass, const std::string& member);
     std::string scanReturn(const std::vector<StmtP>& b);
     // True when `name` calls itself (directly, or transitively within its own
     // body). A recursive function must not use a deduced `auto` return type.
@@ -293,6 +287,12 @@ private:
     // A parameter's Python type: its annotation, else its default value, else
     // std::string when it only ever appears in a string context.
     std::string paramType(const Param& p, const std::vector<StmtP>& body);
+    // Like paramType, but falls back to the type agreed on by every call site
+    // of the owning function (the same type signature() uses to specialise the
+    // parameter), so the body is typed consistently with the specialised
+    // signature instead of treating the parameter as an unknown template.
+    std::string paramTypeWithCallSite(const std::string& fn, size_t idx, const Param& p,
+                                      const std::vector<StmtP>& body);
     std::string compElementType(const Expr* e, bool wantKey);
     std::string pythonToCppType(const std::string& py);
 
@@ -380,6 +380,11 @@ private:
         const Expr* forIter = nullptr;
         size_t forIdx = 0;
         size_t forCount = 0;
+        // True when a for-loop target is read *after* its loop (Python leaves
+        // the last element bound). Such a name needs an explicit declaration;
+        // one that is never read outside the loop can instead be declared
+        // directly in the range-for header (`for (const auto& x : arr)`).
+        bool forLeaked = false;
     };
     void collectBinds(const std::vector<StmtP>& b, std::map<std::string, Bind>& out,
                       std::vector<std::string>* order = nullptr);
@@ -388,7 +393,9 @@ private:
     void emitLocalDecls(const std::map<std::string, Bind>& binds,
                         const std::vector<std::string>& order);
     void declareValue(const std::string& name, const Bind& b);
-    ForPlan planFor(const Expr* iter, const std::vector<std::string>& names, bool declareTargets);
+    ForPlan planFor(const Expr* iter, const std::vector<std::string>& names, bool declareTargets,
+                    bool inlineTarget = false);
+    void markForLeaks(const std::vector<StmtP>& body, std::map<std::string, Bind>& binds);
 
     // ------------------------------------------------------------- functions
     void emitFuncs();
@@ -396,8 +403,18 @@ private:
     void collectCtorArgs(const Expr* e, std::map<std::string, std::vector<std::string>>& out);
     void collectCtorArgsStmt(const Stmt* s,
                              std::map<std::string, std::vector<std::string>>& out);
+    void collectFuncCallArgs(const Expr* e, std::map<std::string, std::vector<std::string>>& out);
+    void collectFuncCallArgsStmt(const Stmt* s,
+                                 std::map<std::string, std::vector<std::string>>& out);
+    // Iteratively propagate types across functions: the parameter type of a
+    // function that returns an object, and the type of an object passed to
+    // another function, are both inferred by repeatedly walking the bodies
+    // (binding parameters and tracking local variables) until fixpoint.
+    void propagateCallTypes(const std::vector<StmtP>& body);
+    void propagateCallTypesStmt(const Stmt* s);
     std::string signature(const Stmt* f, const std::string& cxxName, bool withDefaults,
-                          std::string& tmpl);
+                          std::string& tmpl, const std::string& typeKey = "",
+                          bool allowTemplate = true);
 };
 
 // ===========================================================================
@@ -487,8 +504,8 @@ std::string Nat::callType(const Expr* e) {
         }
         std::string rt = typeOf(obj);
         const std::string& m = c->s;
-        need("string");
         if (isStrT(rt)) {
+            need("string");
             if (m == "upper" || m == "lower" || m == "strip" || m == "lstrip" ||
                 m == "rstrip" || m == "title" || m == "capitalize" || m == "replace" ||
                 m == "join" || m == "zfill")
@@ -529,6 +546,10 @@ std::string Nat::callType(const Expr* e) {
             if (m == "copy") return rt;
             return "";
         }
+        // A method call on a user-class instance: resolve its return type from
+        // the class's method body (so `str(p.name())` etc. format correctly).
+        if (!rt.empty() && klasses.count(rt))
+            return methodReturnType(rt, m);
         return "";
     }
     if (c->kind != EK::Name) return "";
@@ -610,7 +631,8 @@ std::string Nat::funcReturnType(const std::string& name) {
     if (f == funcs.end()) return "";
     funcRet[name] = "";  // also makes a recursive call terminate
     push();
-    size_t ti = 0;
+    size_t ti = 0;  // template-parameter counter (for the T<n> fallback)
+    size_t pi = 0;  // ordinary-parameter index, matching funcArgTypes[]
     for (const auto& p : f->second->params) {
         if (p.name == "self" || p.isKwStar) continue;
         if (p.isStar) {
@@ -624,16 +646,159 @@ std::string Nat::funcReturnType(const std::string& name) {
         } else if (p.def) {
             bind(p.name, typeOf(p.def.get()));
         } else {
-            // No annotation/default: this becomes a template parameter T<n> in
-            // signature(), so bind it to that name — `return n` then resolves
-            // to T0, which a recursive function needs spelled out.
-            bind(p.name, "T" + std::to_string(ti));
+            // No annotation/default. Prefer the concrete type every call site
+            // agreed on (which signature() also used to specialise the
+            // parameter); only fall back to T<n> when that is unavailable.
+            std::string concrete;
+            auto it = funcArgTypes.find(name);
+            if (it != funcArgTypes.end() && pi < it->second.size()) {
+                const std::string& t = it->second[pi];
+                if (!t.empty() && t != "\x01") concrete = t;
+            }
+            bind(p.name, concrete.empty() ? "T" + std::to_string(ti) : concrete);
         }
         ti++;
+        pi++;
     }
     std::string r = scanReturn(f->second->body);
+    // A `return result` whose type is a local variable (e.g. `result = []` then
+    // `return result`) needs the locals' types too. Resolve them from the body's
+    // assignments, then retry.
+    if (r.empty()) {
+        std::map<std::string, Bind> binds;
+        std::vector<std::string> border;
+        collectBinds(f->second->body, binds, &border);
+        for (const auto& n : border) {
+            auto it = binds.find(n);
+            if (it == binds.end()) continue;
+            std::string t;
+            if (!it->second.ann.empty()) t = pythonToCppType(it->second.ann);
+            else if (it->second.first) t = typeOf(it->second.first);
+            else if (it->second.forIter) {
+                auto ts = forTargetTypes(it->second.forIter, it->second.forCount);
+                if (it->second.forIdx < ts.size()) t = ts[it->second.forIdx];
+            }
+            if (!t.empty()) bind(n, t);
+        }
+        r = scanReturn(f->second->body);
+    }
     pop();
     funcRet[name] = r;
+    return r;
+}
+
+// The C++ type of a class member, read off its `self.x = ...` in `__init__`.
+// Prefer the already-resolved table (filled in emitClass, which runs before
+// emitFuncs and main); fall back to reading `__init__` directly for callers
+// that run before the class is emitted (e.g. methodReturnType's own scan).
+std::string Nat::memberType(const std::string& klass, const std::string& member) {
+    auto pub = classMembers.find(klass);
+    if (pub != classMembers.end()) {
+        auto it = pub->second.find(member);
+        if (it != pub->second.end()) return it->second;
+    }
+    auto k = klasses.find(klass);
+    if (k == klasses.end()) return "";
+    for (const auto& m : k->second->body) {
+        if (m->kind != SK::FuncDef || m->s != "__init__") continue;
+        for (const auto& st : m->body) {
+            const Expr* tgt = st->kind == SK::Assign && st->targets.size() == 1
+                                  ? st->targets[0].get()
+                                  : (st->kind == SK::AnnAssign ? st->a.get() : nullptr);
+            if (!tgt || tgt->kind != EK::Attr || !tgt->a || tgt->a->kind != EK::Name ||
+                tgt->a->s != "self" || tgt->s != member)
+                continue;
+            if (st->kind == SK::AnnAssign && st->b) {
+                std::string a = pythonToCppType(ex(st->b.get()));
+                if (!a.empty()) return a;
+            }
+            const Expr* val = st->kind == SK::Assign ? (st->values.empty()
+                                                            ? nullptr
+                                                            : st->values[0].get())
+                                                     : st->c.get();
+            std::string t = typeOf(val);
+            if (!t.empty()) return t;
+        }
+    }
+    return "";
+}
+
+// The type of a class attribute, read off a module-level assignment in the
+// class body (`version = 3`) or an annotated assignment (`name: str = "x"`).
+std::string Nat::staticMemberType(const std::string& klass, const std::string& member) {
+    auto k = klasses.find(klass);
+    if (k == klasses.end()) return "";
+    for (const auto& m : k->second->body) {
+        if (m->kind == SK::Assign && m->targets.size() == 1 &&
+            m->targets[0]->kind == EK::Name && m->targets[0]->s == member &&
+            !m->values.empty()) {
+            std::string t = typeOf(m->values[0].get());
+            if (!t.empty()) return t;
+        } else if (m->kind == SK::AnnAssign && m->a && m->a->kind == EK::Name &&
+                   m->a->s == member && m->b) {
+            std::string t = pythonToCppType(ex(m->b.get()));
+            if (!t.empty()) return t;
+        }
+    }
+    return "";
+}
+
+// Return type of a class method. `self.x` must resolve, so the class's member
+// types are first collected from its `__init__` (self.x = ...) and bound, then
+// the method's own parameters, before scanning its `return` statements.
+std::string Nat::methodReturnType(const std::string& klass, const std::string& method) {
+    std::string key = klass + "." + method;
+    auto memo = funcRet.find(key);
+    if (memo != funcRet.end()) return memo->second;
+    auto k = klasses.find(klass);
+    if (k == klasses.end()) return "";
+    const Stmt* cls = k->second;
+    const Stmt* meth = nullptr;
+    const Stmt* init = nullptr;
+    for (const auto& m : cls->body) {
+        if (m->kind != SK::FuncDef) continue;
+        if (m->s == method) meth = m.get();
+        if (m->s == "__init__") init = m.get();
+    }
+    if (!meth) return "";
+    funcRet[key] = "";  // terminate any recursion
+    push();
+    // Bind member types (self.x = ...). Prefer the table already resolved by
+    // emitClass; fall back to reading __init__ if it hasn't run yet.
+    bind("self", klass);
+    auto pub = classMembers.find(klass);
+    if (pub != classMembers.end()) {
+        for (const auto& kv : pub->second) bind("self." + kv.first, kv.second);
+    } else if (init) {
+        for (const auto& st : init->body) {
+            const Expr* tgt = st->kind == SK::Assign && st->targets.size() == 1
+                                  ? st->targets[0].get()
+                                  : (st->kind == SK::AnnAssign ? st->a.get() : nullptr);
+            if (!tgt || tgt->kind != EK::Attr || !tgt->a || tgt->a->kind != EK::Name ||
+                tgt->a->s != "self")
+                continue;
+            const Expr* val = st->kind == SK::Assign ? (st->values.empty() ? nullptr
+                                                                           : st->values[0].get())
+                                                     : st->c.get();
+            std::string t = typeOf(val);
+            if (!t.empty()) bind("self." + tgt->s, t);
+        }
+    }
+    // Bind the method's parameters.
+    size_t pi = 0;
+    for (const auto& p : meth->params) {
+        if (p.name == "self" || p.isKwStar) continue;
+        if (p.isStar) {
+            pi++;
+            continue;
+        }
+        if (!p.annotation.empty()) bind(p.name, pythonToCppType(p.annotation));
+        else if (p.def) bind(p.name, typeOf(p.def.get()));
+        pi++;
+    }
+    std::string r = scanReturn(meth->body);
+    pop();
+    funcRet[key] = r;
     return r;
 }
 
@@ -955,6 +1120,21 @@ std::string Nat::paramType(const Param& p, const std::vector<StmtP>& body) {
     return r;
 }
 
+std::string Nat::paramTypeWithCallSite(const std::string& fn, size_t idx, const Param& p,
+                                       const std::vector<StmtP>& body) {
+    std::string r = paramType(p, body);
+    if (!r.empty()) return r;
+    // No annotation/default and not string-only: look at the call sites. When
+    // they all agree on one type, use it; otherwise the body keeps treating the
+    // parameter as an unknown template (decltype fallbacks still apply).
+    auto it = funcArgTypes.find(fn);
+    if (it != funcArgTypes.end() && idx < it->second.size()) {
+        const std::string& t = it->second[idx];
+        if (!t.empty() && t != "\x01") return t;
+    }
+    return r;
+}
+
 // `def inner(...)` inside another function becomes a lambda that captures the
 // enclosing locals by reference, which is what a Python closure does.
 void Nat::emitNestedFunc(const Stmt* f) {
@@ -987,6 +1167,7 @@ void Nat::emitNestedFunc(const Stmt* f) {
     std::map<std::string, Bind> binds;
     std::vector<std::string> border;
     collectBinds(f->body, binds, &border);
+    markForLeaks(f->body, binds);
     emitLocalDecls(binds, border);
     emitBody(f->body);
     pop();
@@ -1102,6 +1283,24 @@ std::string Nat::typeOf(const Expr* e) {
                     if (m == "pi" || m == "e" || m == "tau" || m == "inf" || m == "nan")
                         return "double";
                 }
+            }
+            // `self.x`: the member type bound while inferring a method's return.
+            if (obj && obj->kind == EK::Name && obj->s == "self") {
+                std::string t = typeOfName("self." + e->s);
+                if (!t.empty()) return t;
+            }
+            // `obj.x` where obj is a user-class instance: its member type.
+            if (obj) {
+                std::string rt = typeOf(obj);
+                if (!rt.empty() && klasses.count(rt)) {
+                    std::string t = memberType(rt, e->s);
+                    if (!t.empty()) return t;
+                }
+            }
+            // `Config.version`: a class attribute.
+            if (obj && obj->kind == EK::Name && klasses.count(obj->s)) {
+                std::string t = staticMemberType(obj->s, e->s);
+                if (!t.empty()) return t;
             }
             return "";
         }
@@ -1442,6 +1641,9 @@ std::string Nat::reprText(const Expr* e) {
         if (isMapT(t)) noteDictOrder(e->line);
         return containerText(t, exP(e));
     }
+    // A user-class instance with a `__str__`: Python's print(obj) calls it.
+    if (klasses.count(t) && !methodReturnType(t, "__str__").empty())
+        return exP(e) + ".__str__()";
     return ex(e);
 }
 
@@ -2462,6 +2664,13 @@ std::string Nat::call(const Expr* e) {
         }
         std::string m = exprMethod(e, recv, c->s);
         if (!m.empty()) return m;
+        // A method call on a user-class instance: `p.dist(...)` maps directly to
+        // `p.dist(...)` since the class methods are emitted as member functions.
+        if (obj) {
+            std::string rt = typeOf(obj);
+            if (!rt.empty() && klasses.count(rt))
+                return recv + "." + c->s + "(" + argList(e) + ")";
+        }
         err(e->line, "native mode does not translate `." + c->s +
                          "()` here; the core set of str/list/dict/set methods is in README");
         return "0";
@@ -2813,6 +3022,9 @@ std::string Nat::ex(const Expr* e) {
             if ((e->s == "text" || e->s == "content") && obj &&
                 isStrT(typeOf(obj)))
                 return exP(obj);
+            // `Config.version`: a class attribute, accessed through `::` in C++.
+            if (obj && obj->kind == EK::Name && klasses.count(obj->s))
+                return obj->s + "::" + e->s;
             return exP(obj) + "." + e->s;
         }
         case EK::Subscript: return subscript(e);
@@ -2976,7 +3188,8 @@ std::vector<std::string> Nat::forTargetTypes(const Expr* iter, size_t count) {
     return r;
 }
 
-ForPlan Nat::planFor(const Expr* iter, const std::vector<std::string>& names, bool declareTargets) {
+ForPlan Nat::planFor(const Expr* iter, const std::vector<std::string>& names, bool declareTargets,
+                     bool inlineTarget) {
     ForPlan p;
     if (!iter || names.empty()) {
         p.why = "unsupported for-loop";
@@ -3086,6 +3299,13 @@ ForPlan Nat::planFor(const Expr* iter, const std::vector<std::string>& names, bo
     if (isVecT(it) || isSetT(it)) {
         std::string el = elemOf(it);
         if (names.size() == 1) {
+            if (inlineTarget) {
+                // The loop variable is read only inside the loop: declare it
+                // directly in the header, exactly as a person would write it.
+                p.header = "for (const auto& " + names[0] + " : " + iv + ")";
+                p.ok = true;
+                return p;
+            }
             p.header = "for (const auto& __e0 : " + iv + ")";
             assign(names[0], "__e0");
             p.ok = true;
@@ -3117,6 +3337,11 @@ ForPlan Nat::planFor(const Expr* iter, const std::vector<std::string>& names, bo
         return p;
     }
     if (names.size() == 1) {
+        if (inlineTarget) {
+            p.header = "for (const auto& " + names[0] + " : " + iv + ")";
+            p.ok = true;
+            return p;
+        }
         p.header = "for (const auto& __e0 : " + iv + ")";
         assign(names[0], "__e0");
         p.ok = true;
@@ -3193,6 +3418,107 @@ void Nat::collectBinds(const std::vector<StmtP>& b, std::map<std::string, Bind>&
     }
 }
 
+// Decide, for every for-loop target in `body`, whether it is read after its
+// loop. A target read only inside its own loop can be declared straight in the
+// range-for header; one read later (Python keeps the last element bound) must
+// keep an explicit declaration that the loop assigns into.
+void Nat::markForLeaks(const std::vector<StmtP>& body, std::map<std::string, Bind>& binds) {
+    // This set is per-scope: recompute it for the current body rather than
+    // accumulating stale names from a previously emitted function.
+    leakedForTargets.clear();
+    // Count reads of one name in an expression.
+    auto readsExpr = [&](auto&& self, const Expr* e, const std::string& name) -> int {
+        if (!e) return 0;
+        int n = (e->kind == EK::Name && e->s == name) ? 1 : 0;
+        n += self(self, e->a.get(), name);
+        n += self(self, e->b.get(), name);
+        n += self(self, e->c.get(), name);
+        n += self(self, e->d.get(), name);
+        for (const auto& it : e->items) n += self(self, it.get(), name);
+        for (const auto& it : e->compIters) n += self(self, it.get(), name);
+        for (const auto& cl : e->compIfsNested)
+            for (const auto& it : cl) n += self(self, it.get(), name);
+        for (const auto& p : e->kwargs) n += self(self, p.second.get(), name);
+        for (const auto& p : e->parts)
+            if (p.isExpr) n += self(self, p.expr.get(), name);
+        return n;
+    };
+    // Count reads of one name in a statement subtree.
+    std::function<int(const Stmt*, const std::string&)> readsStmt;
+    readsStmt = [&](const Stmt* s, const std::string& name) -> int {
+        if (!s) return 0;
+        int n = 0;
+        switch (s->kind) {
+            case SK::FuncDef:
+            case SK::ClassDef:
+                return 0;  // nested scope
+            case SK::Assign:
+                n += s->values.empty() ? 0 : readsExpr(readsExpr, s->values[0].get(), name);
+                break;
+            case SK::AugAssign:
+                n += readsExpr(readsExpr, s->a.get(), name);
+                n += s->b ? readsExpr(readsExpr, s->b.get(), name) : 0;
+                break;
+            case SK::AnnAssign:
+                n += s->c ? readsExpr(readsExpr, s->c.get(), name) : 0;
+                break;
+            case SK::For:
+                n += readsExpr(readsExpr, s->iter.get(), name);
+                break;
+            case SK::If:
+            case SK::While:
+                n += readsExpr(readsExpr, s->a.get(), name);
+                break;
+            case SK::ExprStmt:
+            case SK::Return:
+                n += readsExpr(readsExpr, s->a.get(), name);
+                break;
+            default:
+                n += readsExpr(readsExpr, s->a.get(), name);
+                n += readsExpr(readsExpr, s->b.get(), name);
+                n += readsExpr(readsExpr, s->c.get(), name);
+                break;
+        }
+        for (const auto& x : s->body) n += readsStmt(x.get(), name);
+        for (const auto& x : s->orelse) n += readsStmt(x.get(), name);
+        for (const auto& x : s->finalbody) n += readsStmt(x.get(), name);
+        for (const auto& h : s->handlers)
+            for (const auto& x : h.body) n += readsStmt(x.get(), name);
+        return n;
+    };
+
+    // For each for-loop statement, compare the target's reads in the whole body
+    // against its reads inside that loop; the difference is "after the loop".
+    std::function<void(const std::vector<StmtP>&)> walk;
+    walk = [&](const std::vector<StmtP>& b) {
+        for (const auto& s : b) {
+            if (!s) continue;
+            if (s->kind == SK::For && s->a) {
+                for (const auto& nm : targetNames(s->a.get())) {
+                    auto it = binds.find(nm);
+                    if (it == binds.end() || !it->second.forIter) continue;
+                    // Reads of nm in the loop's own body (the "inside" part).
+                    int inside = 0;
+                    for (const auto& x : s->body) inside += readsStmt(x.get(), nm);
+                    for (const auto& x : s->orelse) inside += readsStmt(x.get(), nm);
+                    // Reads of nm in the whole function/global body.
+                    int total = 0;
+                    for (const auto& x : body) total += readsStmt(x.get(), nm);
+                    if (total > inside) {
+                        it->second.forLeaked = true;
+                        leakedForTargets.insert(nm);
+                    }
+                }
+            }
+            walk(s->body);
+            walk(s->orelse);
+            walk(s->finalbody);
+            for (const auto& h : s->handlers) walk(h.body);
+        }
+    };
+    walk(body);
+}
+
 void Nat::declareValue(const std::string& name, const Bind& b) {
     // A declared type that names std::string needs <string>, even though
     // typeOf() no longer has that side effect (so a bare "hi" literal does not
@@ -3204,16 +3530,37 @@ void Nat::declareValue(const std::string& name, const Bind& b) {
     if (!b.ann.empty()) {
         declT(b.ann);
         line(b.ann + " " + name + "{};");
+        defaultInitNames.insert(name);
         bind(name, b.ann);
         return;
     }
     if (b.forIter) {
         std::vector<std::string> ts = forTargetTypes(b.forIter, b.forCount);
         std::string ft = b.forIdx < ts.size() ? ts[b.forIdx] : std::string();
+        // A single loop variable read only inside its own loop needs no
+        // explicit declaration: the range-for header declares it (`const auto&
+        // x`). Multi-target loops (for k, v in ...) keep their declarations.
+        // Bind its type anyway so the body can resolve it, but emit nothing.
+        if (b.forCount == 1 && !b.forLeaked) {
+            bind(name, ft);
+            return;
+        }
         if (!ft.empty()) {
             declT(ft);
             line(ft + " " + name + "{};");
+            defaultInitNames.insert(name);
             bind(name, ft);
+            return;
+        }
+        // The iterable's element type could not be named (typically because the
+        // iterable is an unannotated parameter, i.e. a template type). Spell the
+        // loop variable's type as the iterable's value_type, which resolves once
+        // the template is instantiated.
+        std::string iv = recvText(b.forIter);
+        if (!iv.empty()) {
+            line("typename decltype(" + iv + ")::value_type " + name + "{};");
+            defaultInitNames.insert(name);
+            bind(name, "");
             return;
         }
     }
@@ -3221,12 +3568,14 @@ void Nat::declareValue(const std::string& name, const Bind& b) {
     if (!t.empty()) {
         declT(t);
         line(t + " " + name + "{};");
+        defaultInitNames.insert(name);
         bind(name, t);
         return;
     }
     if (b.first) {
         need("type_traits");
         line("std::decay_t<decltype(" + ex(b.first) + ")> " + name + "{};");
+        defaultInitNames.insert(name);
         bind(name, "");
         return;
     }
@@ -3387,6 +3736,13 @@ void Nat::emitAssign(const Stmt* s) {
     for (const auto& t : s->targets) {
         const Expr* tgt = t.get();
         if (tgt->kind == EK::Name) {
+            // `x = 0` / `x = []` right after `x{};` is a no-op the declaration
+            // already performed: drop it. Any other value ends the "still
+            // default" state, since the name now holds something real.
+            if (defaultInitNames.count(tgt->s) && v && isDefaultValue(v) && tmp.empty() &&
+                s->targets.size() == 1)
+                continue;
+            if (defaultInitNames.count(tgt->s)) defaultInitNames.erase(tgt->s);
             line(tgt->s + " = " + (tmp.empty() ? (v ? ex(v) : std::string("{}")) : tmp) + ";");
         } else if (tgt->kind == EK::Subscript) {
             line(elementRef(tgt->a.get(), tgt->b.get(), true) + " = " +
@@ -3440,6 +3796,9 @@ void Nat::emitAugAssign(const Stmt* s) {
     std::string op = s->s;
     if (op.empty() || op.back() != '=') op += "=";
     std::string ta = typeOf(s->a.get()), tv = typeOf(s->b.get());
+    // Augmented assignment changes the variable, so a later `x = 0` is a real
+    // operation again, not a redundant default.
+    if (s->a && s->a->kind == EK::Name) defaultInitNames.erase(s->a->s);
 
     if (op == "//=") {
         need("cmath");
@@ -3505,6 +3864,7 @@ void Nat::emitTry(const Stmt* s) {
     need("stdexcept");
     line("try {");
     ind++;
+    defaultInitNames.clear();  // the try body may not complete
     emitBody(s->body);
     ind--;
 
@@ -3565,7 +3925,11 @@ void Nat::emitTry(const Stmt* s) {
 
 void Nat::emitFor(const Stmt* s) {
     std::vector<std::string> names = targetNames(s->a.get());
-    ForPlan plan = planFor(s->iter.get(), names, false);
+    // A single loop variable that is never read after the loop can be declared
+    // directly in the range-for header; otherwise it must have been declared up
+    // front (leakedForTargets) and the loop assigns into it.
+    bool inlineTarget = names.size() == 1 && !leakedForTargets.count(names[0]);
+    ForPlan plan = planFor(s->iter.get(), names, inlineTarget, inlineTarget);
     if (!plan.ok) {
         err(s->line, plan.why);
         return;
@@ -3580,6 +3944,9 @@ void Nat::emitFor(const Stmt* s) {
     line(plan.header + " {");
     ind++;
     for (const auto& p : plan.prologue) line(p);
+    // A loop body may run many times (or not at all), so a default assignment
+    // inside it is not redundant and must not be dropped.
+    defaultInitNames.clear();
     emitBody(s->body);
     ind--;
     line("}");
@@ -3603,6 +3970,7 @@ void Nat::emitWhile(const Stmt* s) {
     breakFlag = flag;
     line("while (" + ex(s->a.get()) + ") {");
     ind++;
+    defaultInitNames.clear();  // loop body runs repeatedly
     emitBody(s->body);
     ind--;
     line("}");
@@ -3623,6 +3991,7 @@ void Nat::emitIf(const Stmt* s) {
         line((first ? "if (" : "} else if (") + ex(cur->a.get()) + ") {");
         first = false;
         ind++;
+        defaultInitNames.clear();  // a branch may or may not run
         emitBody(cur->body);
         ind--;
         if (!cur->orelse.empty() && cur->orelse.size() == 1 &&
@@ -3635,6 +4004,7 @@ void Nat::emitIf(const Stmt* s) {
     if (!cur->orelse.empty()) {
         line("} else {");
         ind++;
+        defaultInitNames.clear();
         emitBody(cur->orelse);
         ind--;
     }
@@ -3732,10 +4102,23 @@ void Nat::emitStmt(const Stmt* s) {
 // ===========================================================================
 
 // Returns the parameter list; `tmpl` receives the template header (no newline).
+// `typeKey` is the funcArgTypes lookup key: the function/method name for a
+// function, or `Class.method` for a class method (whose emitted name is just
+// `method`, which would otherwise not find its call-site types).
 std::string Nat::signature(const Stmt* f, const std::string& cxxName, bool withDefaults,
-                           std::string& tmpl) {
+                           std::string& tmpl, const std::string& typeKey,
+                           bool allowTemplate) {
     std::vector<std::string> tps, ps;
-    size_t ti = 0;
+    size_t ti = 0;   // template-parameter counter (counts *args packs too)
+    size_t pi = 0;   // ordinary-parameter index, matches funcArgTypes[] positions
+    const std::string& key = typeKey.empty() ? cxxName : typeKey;
+    // The argument types seen at the call sites, if every site agreed on one.
+    auto argTy = [&](size_t idx) -> std::string {
+        auto it = funcArgTypes.find(key);
+        if (it == funcArgTypes.end() || idx >= it->second.size()) return "";
+        const std::string& t = it->second[idx];
+        return (t.empty() || t == "\x01") ? "" : t;
+    };
     for (const auto& p : f->params) {
         if (p.name == "self") continue;
         if (p.isKwStar) {
@@ -3757,13 +4140,33 @@ std::string Nat::signature(const Stmt* f, const std::string& cxxName, bool withD
             if (bodyMutates(f->body, p.name) && isContainerT(t)) t += "&";
             ps.push_back(t + " " + p.name +
                          (withDefaults ? " = " + ex(p.def.get()) : std::string()));
+            pi++;
+            continue;
+        }
+        // No annotation or default. Prefer a concrete type agreed on by every
+        // call site; only fall back to a template parameter when the sites
+        // disagree or the type is unknown (so the code stays readable instead of
+        // instantiating a template for every distinct argument type).
+        std::string concrete = argTy(pi);
+        pi++;
+        if (!concrete.empty()) {
+            if (concrete.find("std::string") != std::string::npos) need("string");
+            bool mut = bodyMutates(f->body, p.name);
+            ps.push_back(concrete + (mut && isContainerT(concrete) ? "&" : "") + " " + p.name);
+            continue;
+        }
+        // Constructors (and methods) must not become templates: when the type is
+        // unknown, fall back to a plain `long long` so `Point(...)` stays a real
+        // constructor rather than a `template <...> Point(...)`.
+        if (!allowTemplate) {
+            ps.push_back(std::string("long long ") + p.name);
             continue;
         }
         std::string tn = "T" + std::to_string(ti++);
         tps.push_back("class " + tn);
-        // Without an annotation or default we cannot name the type up front, so
-        // this is a template parameter. If the body mutates it in place it must
-        // be a reference, or the caller's container is left untouched.
+        // Without a usable type we fall back to a template parameter. If the
+        // body mutates it in place it must be a reference, or the caller's
+        // container is left untouched.
         bool mut = bodyMutates(f->body, p.name);
         ps.push_back(tn + (mut ? "&" : "") + " " + p.name);
     }
@@ -3792,14 +4195,19 @@ void Nat::emitFuncs() {
         inFunction = true;
         push();
         paramNames.clear();
+        defaultInitNames.clear();  // per-function: no stale names from elsewhere
+        size_t pi = 0;  // ordinary-parameter index, matching funcArgTypes[]
         for (const auto& p : f->params) {
             if (p.name == "self" || p.isKwStar) continue;
-            bind(p.name, paramType(p, f->body));
+            if (p.isStar) continue;
+            bind(p.name, paramTypeWithCallSite(n, pi, p, f->body));
             paramNames.insert(p.name);
+            pi++;
         }
         std::map<std::string, Bind> binds;
         std::vector<std::string> border;
         collectBinds(f->body, binds, &border);
+        markForLeaks(f->body, binds);
         emitLocalDecls(binds, border);
         emitBody(f->body);
         pop();
@@ -3851,6 +4259,156 @@ void Nat::collectCtorArgsStmt(const Stmt* s,
         for (const auto& x : h.body) collectCtorArgsStmt(x.get(), out);
 }
 
+// Argument types of every `f(...)` call to a user-defined function. Used to
+// specialise the function's signature: when a parameter is passed the same
+// type at every call site, it is spelled concretely rather than left as a
+// template parameter. Only positional arguments contribute (keyword arguments
+// are emitted as such and are not resolved against a position here); a call
+// whose argument type cannot be resolved leaves that slot empty rather than
+// forcing a wrong specialisation.
+void Nat::collectFuncCallArgs(const Expr* e,
+                              std::map<std::string, std::vector<std::string>>& out) {
+    if (!e) return;
+    // Both user functions and user-class constructors: `f(...)` and `Point(...)`
+    // are collected under the same name so signature() can specialise them the
+    // same way. (The constructor is emitted as `Point(args)`, whose name matches
+    // the class, so `funcArgTypes["Point"]` supplies its parameter types.)
+    if (e->kind == EK::Call && e->a && e->a->kind == EK::Name &&
+        (funcs.count(e->a->s) || klasses.count(e->a->s))) {
+        auto& slot = out[e->a->s];
+        for (size_t i = 0; i < e->items.size(); ++i) {
+            std::string t = typeOf(e->items[i].get());
+            if (t.empty()) continue;  // unknown here; a known site may still win
+            if (slot.size() <= i) slot.resize(i + 1);
+            if (slot[i].empty()) slot[i] = t;
+            else if (slot[i] != t) slot[i] = "\x01";  // conflicting: force generic
+        }
+    }
+    // A method call on a user-class instance: keyed by `Class.method` so the
+    // method's parameters can be specialised the same way as functions.
+    if (e->kind == EK::Call && e->a && e->a->kind == EK::Attr && e->a->a) {
+        std::string rt = typeOf(e->a->a.get());
+        if (!rt.empty() && klasses.count(rt)) {
+            auto& slot = out[rt + "." + e->a->s];
+            for (size_t i = 0; i < e->items.size(); ++i) {
+                std::string t = typeOf(e->items[i].get());
+                if (t.empty()) continue;
+                if (slot.size() <= i) slot.resize(i + 1);
+                if (slot[i].empty()) slot[i] = t;
+                else if (slot[i] != t) slot[i] = "\x01";
+            }
+        }
+    }
+    collectFuncCallArgs(e->a.get(), out);
+    collectFuncCallArgs(e->b.get(), out);
+    collectFuncCallArgs(e->c.get(), out);
+    collectFuncCallArgs(e->d.get(), out);
+    for (const auto& it : e->items) collectFuncCallArgs(it.get(), out);
+    for (const auto& it : e->compIters) collectFuncCallArgs(it.get(), out);
+    for (const auto& it : e->compTargets) collectFuncCallArgs(it.get(), out);
+    for (const auto& p : e->kwargs) collectFuncCallArgs(p.second.get(), out);
+    for (const auto& p : e->parts)
+        if (p.isExpr) collectFuncCallArgs(p.expr.get(), out);
+}
+
+void Nat::collectFuncCallArgsStmt(const Stmt* s,
+                                  std::map<std::string, std::vector<std::string>>& out) {
+    if (!s) return;
+    // Call sites inside a function body need that function's parameter types,
+    // which are not known at collection time (they are the very types we are
+    // trying to infer). Only module-level (main-body) call sites are collected,
+    // where every argument's type is already resolved.
+    if (s->kind == SK::FuncDef || s->kind == SK::ClassDef) return;
+    collectFuncCallArgs(s->a.get(), out);
+    collectFuncCallArgs(s->b.get(), out);
+    collectFuncCallArgs(s->c.get(), out);
+    collectFuncCallArgs(s->iter.get(), out);
+    for (const auto& t : s->targets) collectFuncCallArgs(t.get(), out);
+    for (const auto& t : s->values) collectFuncCallArgs(t.get(), out);
+    for (const auto& x : s->body) collectFuncCallArgsStmt(x.get(), out);
+    for (const auto& x : s->orelse) collectFuncCallArgsStmt(x.get(), out);
+    for (const auto& x : s->finalbody) collectFuncCallArgsStmt(x.get(), out);
+    for (const auto& h : s->handlers)
+        for (const auto& x : h.body) collectFuncCallArgsStmt(x.get(), out);
+}
+
+// Walk a sequence of statements, resolving a call's argument types with the
+// current local/parameter bindings and recording `name = expr` so later calls
+// in the same body can see the type of `name`. This is what lets `make_pair`
+// return a `Pair`, and `swap_pair(p)` see `p` as a `Pair`, without any
+// annotation: the caller's `p = make_pair(1, 2)` propagates the type in.
+void Nat::propagateCallTypes(const std::vector<StmtP>& body) {
+    for (const auto& sp : body) {
+        const Stmt* s = sp.get();
+        if (!s) continue;
+        if (s->kind == SK::ClassDef) continue;
+        if (s->kind == SK::FuncDef) {
+            // Enter the function body with its parameters bound to whatever
+            // funcArgTypes already knows (annotations/defaults too), so that a
+            // `Pair(x, y)` built from parameters, or a method call on a
+            // parameter, resolves to a concrete type.
+            push();
+            size_t pi = 0;
+            for (const auto& p : s->params) {
+                if (p.name == "self" || p.isKwStar) continue;
+                if (p.isStar) {
+                    pi++;
+                    continue;
+                }
+                std::string t;
+                if (!p.annotation.empty()) t = pythonToCppType(p.annotation);
+                else if (p.def) t = typeOf(p.def.get());
+                else {
+                    auto it = funcArgTypes.find(s->s);
+                    if (it != funcArgTypes.end() && pi < it->second.size() &&
+                        !it->second[pi].empty() && it->second[pi] != "\x01")
+                        t = it->second[pi];
+                }
+                if (!t.empty()) bind(p.name, t);
+                pi++;
+            }
+            propagateCallTypes(s->body);
+            pop();
+            continue;
+        }
+        propagateCallTypesStmt(s);
+    }
+}
+
+void Nat::propagateCallTypesStmt(const Stmt* s) {
+    if (!s) return;
+    // `name = expr` (and annotated assignments) give later statements the type
+    // of `name`, so `p = make_pair(1, 2)` lets `swap_pair(p)` see `p` as a Pair.
+    if (s->kind == SK::Assign && s->targets.size() == 1 && !s->values.empty()) {
+        std::string t = typeOf(s->values[0].get());
+        if (!t.empty())
+            for (const auto& n : targetNames(s->targets[0].get())) bind(n, t);
+    } else if (s->kind == SK::AnnAssign && s->a) {
+        std::string t = s->b ? pythonToCppType(ex(s->b.get())) : typeOf(s->c.get());
+        if (!t.empty())
+            for (const auto& n : targetNames(s->a.get())) bind(n, t);
+    }
+    // Collect the call sites reachable from this statement's expressions (with
+    // the now-resolved locals), then recurse into nested blocks. Constructor
+    // calls (`Pair(x, y)`) also feed ctorArgs so emitClass can type the members.
+    collectFuncCallArgs(s->a.get(), funcArgTypes);
+    collectFuncCallArgs(s->b.get(), funcArgTypes);
+    collectFuncCallArgs(s->c.get(), funcArgTypes);
+    collectFuncCallArgs(s->iter.get(), funcArgTypes);
+    for (const auto& t : s->targets) collectFuncCallArgs(t.get(), funcArgTypes);
+    for (const auto& v : s->values) collectFuncCallArgs(v.get(), funcArgTypes);
+    collectCtorArgs(s->a.get(), ctorArgs);
+    collectCtorArgs(s->b.get(), ctorArgs);
+    collectCtorArgs(s->c.get(), ctorArgs);
+    collectCtorArgs(s->iter.get(), ctorArgs);
+    for (const auto& t : s->targets) collectCtorArgs(t.get(), ctorArgs);
+    for (const auto& v : s->values) collectCtorArgs(v.get(), ctorArgs);
+    propagateCallTypes(s->body);
+    propagateCallTypes(s->orelse);
+    propagateCallTypes(s->finalbody);
+    for (const auto& h : s->handlers) propagateCallTypes(h.body);
+}
+
 void Nat::emitClass(const std::string& name, const Stmt* c) {
     if (!c->bases.empty())
         err(c->line, "native mode does not translate inheritance (`class " + name + "(" +
@@ -3858,10 +4416,31 @@ void Nat::emitClass(const std::string& name, const Stmt* c) {
 
     const Stmt* init = nullptr;
     std::vector<const Stmt*> methods;
+    // Class-level assignments (`version = 3`, `name = "demo"`) become static
+    // members shared by every instance, matching Python's class attributes.
+    std::vector<std::string> staticOrder;
+    std::map<std::string, std::string> staticType;
+    std::map<std::string, const Expr*> staticInit;
     for (const auto& m : c->body) {
-        if (m->kind != SK::FuncDef) continue;
-        if (m->s == "__init__") init = m.get();
-        else methods.push_back(m.get());
+        if (m->kind == SK::FuncDef) {
+            if (m->s == "__init__") init = m.get();
+            else methods.push_back(m.get());
+        } else if (m->kind == SK::Assign && m->targets.size() == 1 &&
+                   m->targets[0]->kind == EK::Name && !m->values.empty()) {
+            std::string t = typeOf(m->values[0].get());
+            if (!t.empty()) {
+                if (!staticType.count(m->targets[0]->s)) staticOrder.push_back(m->targets[0]->s);
+                staticType[m->targets[0]->s] = t;
+                staticInit[m->targets[0]->s] = m->values[0].get();
+            }
+        } else if (m->kind == SK::AnnAssign && m->a && m->a->kind == EK::Name && m->b) {
+            std::string t = pythonToCppType(ex(m->b.get()));
+            if (!t.empty()) {
+                if (!staticType.count(m->a->s)) staticOrder.push_back(m->a->s);
+                staticType[m->a->s] = t;
+                staticInit[m->a->s] = m->c.get();
+            }
+        }
     }
     if (!init && !c->bases.empty()) return;
 
@@ -3911,15 +4490,42 @@ void Nat::emitClass(const std::string& name, const Stmt* c) {
             memberType[tgt->s] = mt;
         }
     }
+    // Publish the resolved member types so typeOf() can resolve `a.x` from any
+    // scope (a module-level function taking `Point`, a method, main, ...).
+    classMembers[name] = memberType;
 
     line("struct " + name + " {");
     ind++;
+    // A user-defined constructor with parameters suppresses the implicit default
+    // constructor, but a module-level `Point p{};` still needs one. Provide it
+    // explicitly unless `__init__` itself takes no arguments (in which case the
+    // generated constructor already is the default constructor).
+    // `= default` is only needed when some non-self parameter has *no* default
+    // value: such a constructor can't be called as `Point()`, yet a default
+    // constructor is still needed for `Point p{}`. If every parameter has a
+    // default (e.g. `def __init__(self, start=0)`), the generated constructor
+    // already doubles as the default one and `= default` would be ambiguous.
+    bool ctorHasParams = init && std::any_of(init->params.begin(), init->params.end(),
+                                             [](const Param& p) { return p.name != "self"; });
+    if (ctorHasParams &&
+        std::any_of(init->params.begin(), init->params.end(),
+                    [](const Param& p) { return p.name != "self" && !p.def; }))
+        line(name + "() = default;");
     for (const auto& m : memberOrder) line(memberType[m] + " " + m + "{};");
     if (!memberOrder.empty()) blank();
+    // Class attributes are shared state: `static` members with an in-class
+    // initialiser (C++17 inline static), so `Config.version` reads work.
+    for (const auto& m : staticOrder) {
+        auto it = staticInit.find(m);
+        std::string init = (it != staticInit.end() && it->second) ? ex(it->second) : "{}";
+        line("static inline " + staticType[m] + " " + m + " = " + init + ";");
+    }
+    if (!staticOrder.empty()) blank();
 
-    auto emitMember = [&](const Stmt* f, const std::string& cxxName, bool isCtor) {
+    auto emitMember = [&](const Stmt* f, const std::string& cxxName, bool isCtor,
+                          const std::string& typeKey) {
         std::string tmpl;
-        std::string sig = signature(f, cxxName, true, tmpl);
+        std::string sig = signature(f, cxxName, true, tmpl, typeKey, false);
         if (!tmpl.empty()) line(tmpl);
         line((isCtor ? std::string() : "auto ") + sig + " {");
         ind++;
@@ -3928,15 +4534,22 @@ void Nat::emitClass(const std::string& name, const Stmt* c) {
         push();
         // `self` refers to the object, exactly as in Python.
         line("auto& self = *this;");
+        // Bind `self` (the class type) and every member's type so `self.area()`
+        // and `self.x` (and methods on it) resolve inside the body.
+        bind("self", name);
+        for (const auto& kv : memberType) bind("self." + kv.first, kv.second);
         paramNames.clear();
+        size_t pi = 0;  // ordinary-parameter index, matching funcArgTypes[]
         for (const auto& p : f->params) {
             if (p.name == "self" || p.isKwStar) continue;
-            bind(p.name, paramType(p, f->body));
+            bind(p.name, paramTypeWithCallSite(typeKey, pi, p, f->body));
             paramNames.insert(p.name);
+            pi++;
         }
         std::map<std::string, Bind> binds;
         std::vector<std::string> border;
         collectBinds(f->body, binds, &border);
+        markForLeaks(f->body, binds);
         emitLocalDecls(binds, border);
         emitBody(f->body);
         pop();
@@ -3945,8 +4558,8 @@ void Nat::emitClass(const std::string& name, const Stmt* c) {
         line("}");
     };
 
-    if (init) emitMember(init, name, true);
-    for (const auto* m : methods) emitMember(m, m->s, false);
+    if (init) emitMember(init, name, true, name);
+    for (const auto* m : methods) emitMember(m, m->s, false, name + "." + m->s);
 
     ind--;
     line("};");
@@ -3979,11 +4592,42 @@ NativeResult Nat::run() {
     std::map<std::string, Bind> globals;
     std::vector<std::string> gorder;
     collectBinds(prog, globals, &gorder);
+    markForLeaks(prog, globals);
     for (const auto& n : gorder) bind(n, "");
     for (const auto& n : gorder) {
         auto f = globals.find(n);
         if (f != globals.end()) bind(n, typeOf(f->second.first));
     }
+    // Call-site argument types are collected *after* the globals are bound, so
+    // `bubble_sort(data)` can see that `data` is a std::vector<long long> and
+    // specialise the signature. (Call sites inside function bodies are handled
+    // separately during emitFuncs.)
+    for (const auto& s : prog) collectFuncCallArgsStmt(s.get(), funcArgTypes);
+
+    // Iteratively propagate types across functions until fixpoint: a function
+    // that builds and returns an object (`return Pair(x, y)`) gives the class
+    // its constructor-parameter types, and a function that receives that object
+    // (`swap_pair(p)`) sees `p` as the class. Each pass re-derives the return
+    // types from the newly-seen argument types, so chains of calls settle.
+    for (int pass = 0; pass < 16; ++pass) {
+        size_t beforeArgs = funcArgTypes.size();
+        size_t beforeCtor = ctorArgs.size();
+        // Re-derive every return type from the argument types known so far (a
+        // cleared memo means `return Pair(x, y)` re-evaluates `x`/`y` with the
+        // types the previous pass discovered).
+        funcRet.clear();
+        push();  // module scope for the propagation walk
+        propagateCallTypes(prog);
+        pop();
+        if (funcArgTypes.size() == beforeArgs && ctorArgs.size() == beforeCtor) break;
+    }
+
+    // Class structs are emitted first, before any function or global that might
+    // reference them: a function `dist_sq(Point a, Point b)` and a global
+    // `Point p{}` both need `struct Point` to already exist. (The methods' own
+    // bodies are emitted here too; they reference only `self`, so they are
+    // safe before the module-level functions and globals.)
+    for (const auto& cn : classOrder) emitClass(cn, klasses[cn]);
 
     // Global variables must be declared *before* the functions that reference
     // them, or a function body reading a module-level name fails to compile.
@@ -4003,8 +4647,12 @@ NativeResult Nat::run() {
     }
     if (anyGlobal) blank();
 
+    // Save the globals that are still default-initialised; emitFuncs() clears
+    // defaultInitNames per function, and main()'s body should still be able to
+    // drop a redundant `scores = {}` right after the global declaration.
+    std::set<std::string> globalsStillDefault = defaultInitNames;
     emitFuncs();
-    for (const auto& cn : classOrder) emitClass(cn, klasses[cn]);
+    defaultInitNames = globalsStillDefault;
 
     line("int main() {");
     ind++;

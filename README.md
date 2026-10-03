@@ -16,7 +16,7 @@ cannot express.
 | Output | plain standard-library C++ | C++ over a small `py::` runtime |
 | Extra files | none — one `.cpp` | `py_runtime.h` |
 | Type mapping | Python types → real C++ types (`list` → `std::vector`) | Python types → `py::` containers |
-| Coverage | a subset; anything it cannot translate faithfully is an **error** | wider — classes, inheritance, `**kwargs` |
+| Coverage | a subset; anything it cannot translate faithfully is an **error** | wider — inheritance, `**kwargs` |
 | Best for | reading, editing and shipping the C++ you get | running Python you would rather not rewrite |
 
 ```bash
@@ -175,6 +175,50 @@ Python creates the key. A division whose divisor is a literal `0` is compiled to
 a `throw` carrying CPython's own message, so `1 / 0` and `1.0 % 0` behave the way
 Python does rather than producing undefined behaviour.
 
+### Classes
+
+A `class` becomes a plain `struct` with the `__init__` body as the constructor.
+Members (`self.x = ...`) become fields, methods become member functions, and
+class attributes (`version = 3`) become `static` members. Call sites specialise
+the constructor and method parameters the same way functions are specialised;
+unlike free functions, a constructor or method never becomes a template — a
+parameter whose type cannot be pinned down falls back to `long long`.
+
+```python
+class Point:
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+
+    def dist(self):
+        return self.x * self.x + self.y * self.y
+
+p = Point(3, 4)
+print(p.dist())
+```
+
+```cpp
+struct Point {
+    long long x{};
+    long long y{};
+
+    Point(long long x, long long y) {
+        auto& self = *this;
+        self.x = x;
+        self.y = y;
+    }
+    auto dist() {
+        auto& self = *this;
+        return (self.x * self.x) + (self.y * self.y);
+    }
+};
+```
+
+`self` maps to `*this`, so `self.x` reads and `self.m()` calls work as in
+Python. A class with a `__str__` method makes `print(obj)` call it. The one
+class feature direct mode cannot express is **inheritance** — a `class
+Square(Shape)` is reported as an error (use `--runtime` for that).
+
 ### What direct mode refuses
 
 The rule is: translate faithfully, or say so. Anything direct mode cannot express
@@ -184,7 +228,7 @@ written**, so a bad translation never slips through.
 ```
 $ ./build/p2cpp examples/10_oop.py -o oop.cpp
 p2cpp: error: line 8: native mode does not translate inheritance (`class Square(Shape)`); use the default mode instead
-p2cpp: error: line 17: native mode does not translate `.area()` here; the core set of str/list/dict/set methods is in README
+p2cpp: cannot translate this program faithfully; add --runtime for maximum-fidelity mode
 ```
 
 The messages name the construct and the fix. The common cases:
