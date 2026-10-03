@@ -359,6 +359,22 @@ A CMake project is also provided for IDEs:
 cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build
 ```
 
+### On Windows
+
+```bat
+build.bat                       # produces build\p2cpp.exe
+```
+
+`build.bat` uses CMake when available (works with both MSVC and MinGW); if CMake
+is not installed it falls back to compiling the five source files directly with
+the first of `cl` / `g++` / `clang++` it finds. Run the test harnesses the same
+way as on Unix:
+
+```bat
+tests\compare_native.bat        # direct backend (the default)
+tests\compare.bat               # --runtime (fidelity) backend
+```
+
 ## Usage
 
 ```
