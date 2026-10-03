@@ -3001,10 +3001,13 @@ std::string Nat::ex(const Expr* e) {
             if (obj && obj->kind == EK::Name && modules.count(obj->s)) {
                 const std::string& m = e->s;
                 if (obj->s == "math") {
-                    need("cmath");
-                    if (m == "pi") return "3.14159265358979323846";
-                    if (m == "e") return "2.71828182845904523536";
-                    if (m == "tau") return "6.28318530717958647692";
+                    // Spell these as plain double literals: the exact value
+                    // CPython exposes for math.pi/math.e/math.tau. They need no
+                    // header (unlike M_PI, which MSVC only defines with
+                    // _USE_MATH_DEFINES), so they compile everywhere.
+                    if (m == "pi") return "3.141592653589793";
+                    if (m == "e") return "2.718281828459045";
+                    if (m == "tau") return "6.283185307179586";
                     if (m == "inf") {
                         need("limits");
                         return "std::numeric_limits<double>::infinity()";
